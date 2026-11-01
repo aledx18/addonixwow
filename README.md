@@ -44,7 +44,8 @@ It reads `default-prefix` from `~/.config/faugus-launcher/config.json`, then che
 
 ## Limitations
 
-- Some authors block third-party downloads. Those addons show a link to their CurseForge page instead.
+- Some authors block third-party downloads, including popular addons like DBM and Details!. Those addons show a link to their CurseForge page instead.
+- CurseForge can block `/v1/mods/search` for a key while allowing other endpoints. The widget then lists only featured Forever addons and filters them by your text.
 - There are no updates or uninstall from the widget yet.
 
 ## Development

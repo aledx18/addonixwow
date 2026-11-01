@@ -28,6 +28,7 @@ Panel {
   property string searchedQuery: ""
   property bool searching: false
   property bool searchLoaded: false
+  property bool searchLimited: false
   property string pendingQuery: ""
   property bool searchQueued: false
   property string errorMessage: ""
@@ -170,6 +171,7 @@ Panel {
       var result = root.parse(searchOutput.text)
       if (result.ok) {
         root.results = result.results
+        root.searchLimited = result.limited === true
         root.searchLoaded = true
       } else {
         root.results = []
@@ -455,6 +457,17 @@ Panel {
 
         Text {
           width: parent.width
+          visible: root.view === "browse" && root.hasKey && root.searchLimited
+          text: "CurseForge blocks full search for this key. Showing featured WoW Forever addons only."
+          color: root.panelForeground
+          opacity: 0.65
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        Text {
+          width: parent.width
           visible: root.view === "browse" && root.hasKey && (root.searching || (root.searchLoaded && root.results.length === 0 && root.errorMessage.length === 0))
           text: root.searching ? "Searching…" : "No WoW Forever addons match your search."
           color: root.panelForeground
@@ -546,16 +559,20 @@ Panel {
                   anchors.right: parent.right
                   anchors.rightMargin: Style.space(10)
                   anchors.verticalCenter: parent.verticalCenter
-                  text: root.installingId === resultCard.modelData.id ? "Installing…" : (resultCard.modelData.installed ? "Reinstall" : "Install")
+                  text: !resultCard.modelData.canInstall ? "Open page" : (root.installingId === resultCard.modelData.id ? "Installing…" : (resultCard.modelData.installed ? "Reinstall" : "Install"))
                   bordered: true
                   selected: false
                   foreground: root.panelForeground
                   fontSize: Style.font.caption
                   horizontalPadding: Style.space(10)
                   verticalPadding: Style.space(4)
-                  enabled: !root.installing && root.addonsPath.length > 0
+                  enabled: !resultCard.modelData.canInstall || (!root.installing && root.addonsPath.length > 0)
                   opacity: enabled ? 1 : 0.6
-                  onClicked: root.install(resultCard.modelData.id)
+                  tooltipText: resultCard.modelData.canInstall ? "" : "The author only allows downloads from CurseForge"
+                  onClicked: {
+                    if (resultCard.modelData.canInstall) root.install(resultCard.modelData.id)
+                    else root.openExternal(resultCard.modelData.url)
+                  }
                 }
               }
             }

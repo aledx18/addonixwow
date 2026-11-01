@@ -144,10 +144,12 @@ class SafeRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def open_url(url, key):
+def open_url(url, key, body=None):
     if not is_allowed_url(url):
         raise AddonixError("network", "Refused an insecure download URL.")
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json, */*"})
+    request = urllib.request.Request(url, data=body, headers={"User-Agent": USER_AGENT, "Accept": "application/json, */*"})
+    if body is not None:
+        request.add_header("Content-Type", "application/json")
     if key and is_key_host(url):
         # Unredirected: the key must never follow a redirect to another host.
         request.add_unredirected_header("x-api-key", key)
@@ -155,12 +157,13 @@ def open_url(url, key):
     return opener.open(request, timeout=TIMEOUT_SECONDS)
 
 
-def api_get(path, key, params=None):
+def api_get(path, key, params=None, body=None):
     url = api_base() + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
+    payload = json.dumps(body).encode("utf-8") if body is not None else None
     try:
-        with open_url(url, key) as response:
+        with open_url(url, key, payload) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):
@@ -355,6 +358,18 @@ def command_status(_args):
     }
 
 
+def featured_mods(key, type_id, query):
+    body = {"gameId": WOW_GAME_ID, "excludedModIds": [], "gameVersionTypeId": type_id}
+    data = api_get("/v1/mods/featured", key, body=body).get("data") or {}
+    merged = {}
+    for group in ("featured", "popular", "recentlyUpdated"):
+        for mod in data.get(group) or []:
+            merged.setdefault(mod.get("id"), mod)
+    needle = query.lower()
+    matches = [mod for mod in merged.values() if needle in f"{mod.get('name', '')} {mod.get('summary', '')}".lower()]
+    return sorted(matches, key=lambda mod: str(mod.get("name", "")).lower())
+
+
 def command_search(args):
     config = load_config()
     key = require_key(config)
@@ -369,10 +384,19 @@ def command_search(args):
     }
     if query:
         params["searchFilter"] = query
-    mods = api_get("/v1/mods/search", key, params).get("data") or []
+    limited = False
+    try:
+        mods = api_get("/v1/mods/search", key, params).get("data") or []
+    except AddonixError as error:
+        if error.code != "invalid_key":
+            raise
+        # Some keys may read addons but not search. featured answers 403 too if the key is really bad.
+        mods = featured_mods(key, type_id, query)
+        limited = True
     installed = load_state().get("mods") or {}
     return {
         "query": query,
+        "limited": limited,
         "results": [
             {
                 "id": mod.get("id"),
@@ -382,6 +406,7 @@ def command_search(args):
                 "logo": (mod.get("logo") or {}).get("thumbnailUrl", ""),
                 "url": (mod.get("links") or {}).get("websiteUrl", ""),
                 "installed": str(mod.get("id")) in installed,
+                "canInstall": mod.get("allowModDistribution") is not False,
             }
             for mod in mods
         ],

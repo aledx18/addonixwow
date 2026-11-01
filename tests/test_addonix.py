@@ -68,6 +68,8 @@ class FakeCurseForge(BaseHTTPRequestHandler):
             return
         if parsed.path == "/v1/games/1/version-types":
             self.send_json({"data": state["version_types"]})
+        elif parsed.path == "/v1/mods/search" and state.get("search_blocked"):
+            self.send_json({}, 403)
         elif parsed.path == "/v1/mods/search" and state.get("truncate_search"):
             self.send_response(200)
             self.send_header("Content-Length", "1000")
@@ -97,6 +99,19 @@ class FakeCurseForge(BaseHTTPRequestHandler):
             self.send_json({"data": state["download_url"]})
         else:
             self.send_json({}, 404)
+
+
+    def do_POST(self):
+        state = self.server.fake
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        state["requests"].append({"path": self.path, "body": body, "key": self.headers.get("x-api-key")})
+        if self.headers.get("x-api-key") != KEY:
+            self.send_json({}, 403)
+            return
+        shared = {"summary": "Quest helper", "downloadCount": 5, "logo": {"thumbnailUrl": ""}, "links": {"websiteUrl": "https://cf/q"}}
+        questie = {"id": 8, "name": "Questie", "allowModDistribution": True, **shared}
+        bagnon = {"id": 9, "name": "Bagnon", "allowModDistribution": False, **shared, "summary": "Bags"}
+        self.send_json({"data": {"featured": [questie], "popular": [bagnon, questie], "recentlyUpdated": []}})
 
 
 class AddonixTest(unittest.TestCase):
@@ -217,13 +232,29 @@ class AddonixTest(unittest.TestCase):
                     "logo": "https://img/logo.png",
                     "url": "https://curseforge.com/wow/addons/dbm",
                     "installed": False,
+                    "canInstall": True,
                 }
             ],
         )
+        self.assertFalse(out["limited"])
         search = [r for r in self.server.fake["requests"] if r["path"] == "/v1/mods/search"][0]
         self.assertEqual(search["query"]["gameVersionTypeId"], [str(FOREVER_TYPE)])
         self.assertEqual(search["query"]["searchFilter"], ["dbm"])
         self.assertEqual(search["query"]["gameId"], ["1"])
+
+    def test_search_blocked_for_key_falls_back_to_featured_addons(self):
+        self.server.fake["search_blocked"] = True
+        code, out = self.run_cli("search", "")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out["limited"])
+        self.assertEqual([(r["name"], r["canInstall"]) for r in out["results"]], [("Bagnon", False), ("Questie", True)])
+        post = [r for r in self.server.fake["requests"] if r["path"] == "/v1/mods/featured"][0]
+        self.assertEqual(post["body"], {"gameId": 1, "excludedModIds": [], "gameVersionTypeId": FOREVER_TYPE})
+
+    def test_blocked_search_filters_featured_addons_by_text(self):
+        self.server.fake["search_blocked"] = True
+        _, out = self.run_cli("search", "BAGS")
+        self.assertEqual([r["name"] for r in out["results"]], ["Bagnon"])
 
     def test_search_fails_closed_when_forever_is_not_listed(self):
         self.server.fake["version_types"] = [{"id": 1, "name": "Retail", "slug": "wow-retail"}]
