@@ -6,7 +6,7 @@ Search and install [CurseForge](https://www.curseforge.com/wow) addons for **Wor
 - Install in one click, with integrity checks and safe archive extraction.
 - Install required dependencies automatically.
 - Check for updates and update one addon or all of them.
-- See installed addons and open the AddOns folder.
+- See installed addons, open the AddOns folder, and uninstall addons (settings in `WTF` are kept).
 
 ## Requirements
 
@@ -50,7 +50,7 @@ It reads `default-prefix` from `~/.config/faugus-launcher/config.json`, then che
 - CurseForge's servers can reject a valid key on some requests and accept it on others, especially soon after creating it. Requests are retried; if search still fails, the widget lists only featured Forever addons and filters them by your text.
 - Updates cover addons installed by AddonixWoW. Addons added by hand are listed but not tracked.
 - A required dependency that the author blocks is reported with a link, and the main addon stays installed.
-- There is no uninstall from the widget yet.
+- Uninstalling does not remove the dependencies an addon brought in. If other addons require the removed one, the widget warns you.
 
 ## Development
 

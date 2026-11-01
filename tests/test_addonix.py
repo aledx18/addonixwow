@@ -472,6 +472,102 @@ class AddonixTest(unittest.TestCase):
         _, out = self.run_cli("update", "20")
         self.assertEqual(out["failed"], [])
 
+    def test_uninstall_removes_all_folders_and_forgets_the_addon(self):
+        self.add_mod(20, "Main", "MainAddon")
+        self.run_cli("install", "20")
+        state_file = self.home / ".local/state/addonixwow/state.json"
+        state = json.loads(state_file.read_text())
+        (self.addons / "MainModule").mkdir()
+        state["mods"]["20"]["folders"].append("MainModule")
+        state_file.write_text(json.dumps(state))
+        code, out = self.run_cli("uninstall", "--mod", "20")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["name"], "Main")
+        self.assertEqual(out["folders"], ["MainAddon", "MainModule"])
+        self.assertEqual(sorted(p.name for p in self.addons.iterdir()), [])
+        self.assertEqual(sorted(p.name for p in self.addons.parent.iterdir()), ["AddOns"])
+        _, status = self.run_cli("status")
+        self.assertEqual(status["installed"], [])
+        _, search = self.run_cli("search", "dbm")
+        self.assertFalse(search["results"][0]["installed"])
+
+    def test_uninstall_keeps_folders_other_addons_use_and_other_addons(self):
+        self.add_mod(20, "Main", "MainAddon")
+        self.add_mod(30, "Other", "OtherAddon")
+        self.run_cli("install", "20")
+        self.run_cli("install", "30")
+        state_file = self.home / ".local/state/addonixwow/state.json"
+        state = json.loads(state_file.read_text())
+        state["mods"]["20"]["folders"] += ["OtherAddon", "../.."]
+        state_file.write_text(json.dumps(state))
+        code, out = self.run_cli("uninstall", "--mod", "20")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["folders"], ["MainAddon"])
+        self.assertTrue((self.addons / "OtherAddon/main.lua").exists())
+        self.assertTrue(self.addons.is_dir())
+
+    def test_uninstall_warns_about_addons_that_require_it(self):
+        self.add_mod(20, "Main", "MainAddon", [(21, 3)])
+        self.add_mod(21, "Lib", "LibAddon")
+        self.run_cli("install", "20")
+        _, out = self.run_cli("uninstall", "--mod", "21")
+        self.assertEqual(out["requiredBy"], ["Main"])
+        self.assertTrue((self.addons / "MainAddon").is_dir())
+        self.assertFalse((self.addons / "LibAddon").exists())
+
+    def test_uninstall_removes_addon_added_by_hand(self):
+        folder = self.addons / "Manual"
+        folder.mkdir()
+        (folder / "Manual.toc").write_text("## Title: Manual Addon\n")
+        code, out = self.run_cli("uninstall", "--folder", "Manual")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["name"], "Manual Addon")
+        self.assertFalse(folder.exists())
+
+    def test_uninstall_folder_refuses_unsafe_names(self):
+        (self.addons / "Keep").mkdir()
+        for name in ("..", ".", "", "../AddOns", "Keep/../..", "/tmp"):
+            code, out = self.run_cli("uninstall", "--folder", name)
+            self.assertEqual(code, 1, name)
+            self.assertEqual(out["code"], "usage", name)
+        self.assertTrue((self.addons / "Keep").is_dir())
+
+    def test_uninstall_folder_refuses_folder_owned_by_managed_addon(self):
+        self.add_mod(20, "Main", "MainAddon")
+        self.run_cli("install", "20")
+        code, out = self.run_cli("uninstall", "--folder", "MainAddon")
+        self.assertEqual(code, 1)
+        self.assertEqual(out["code"], "usage")
+        self.assertTrue((self.addons / "MainAddon").is_dir())
+
+    def test_uninstall_reports_unknown_targets(self):
+        for args in (("--mod", "999"), ("--folder", "Nope")):
+            code, out = self.run_cli("uninstall", *args)
+            self.assertEqual(code, 1)
+            self.assertEqual(out["code"], "not_found")
+
+    def test_uninstall_rejects_bad_arguments(self):
+        for args in ((), ("20",), ("--mod", "abc"), ("--mod", "1", "extra")):
+            code, out = self.run_cli("uninstall", *args)
+            self.assertEqual(code, 1, args)
+            self.assertEqual(out["code"], "usage", args)
+
+    def test_uninstall_removes_symlink_but_not_its_target(self):
+        target = self.home / "elsewhere"
+        target.mkdir()
+        (target / "Linked.toc").write_text("## Title: Linked\n")
+        (self.addons / "Linked").symlink_to(target)
+        code, out = self.run_cli("uninstall", "--folder", "Linked")
+        self.assertEqual(code, 0, out)
+        self.assertFalse((self.addons / "Linked").is_symlink())
+        self.assertTrue((target / "Linked.toc").exists())
+
+    def test_uninstall_needs_no_api_key(self):
+        self.add_mod(20, "Main", "MainAddon")
+        self.run_cli("install", "20")
+        code, _ = self.run_cli("uninstall", "--mod", "20", key=None)
+        self.assertEqual(code, 0)
+
     def test_search_fails_closed_when_forever_is_not_listed(self):
         self.server.fake["version_types"] = [{"id": 1, "name": "Retail", "slug": "wow-retail"}]
         code, out = self.run_cli("search", "dbm")

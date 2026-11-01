@@ -46,6 +46,9 @@ Panel {
   readonly property bool showKeyForm: root.statusLoaded && (!root.hasKey || root.editingKey)
   // installingId value while "Update all" runs; real addon ids are positive.
   readonly property int updatingAllId: -1
+  readonly property int uninstallingId: -2
+  property string pendingRemoval: ""
+  property string removingKey: ""
 
   function open() {
     root.controller.show()
@@ -53,6 +56,7 @@ Panel {
   }
 
   function close() {
+    root.pendingRemoval = ""
     root.controller.hide()
   }
 
@@ -144,6 +148,30 @@ Panel {
       ? ["python3", "-I", root.backend, "update"]
       : ["python3", "-I", root.backend, "update", String(modId)]
     updateProcess.running = true
+  }
+
+  function removalKey(item) {
+    return item.modId ? "mod:" + item.modId : "folder:" + item.folders[0]
+  }
+
+  // First click arms the row, second click removes: deleting folders deserves a confirmation.
+  function requestRemoval(item) {
+    if (root.installing) return
+    var key = root.removalKey(item)
+    if (root.pendingRemoval !== key) {
+      root.pendingRemoval = key
+      removalReset.restart()
+      return
+    }
+    root.pendingRemoval = ""
+    root.clearMessages()
+    root.removingKey = key
+    root.installingId = root.uninstallingId
+    uninstallProcess.removedModId = item.modId || 0
+    uninstallProcess.command = item.modId
+      ? ["python3", "-I", root.backend, "uninstall", "--mod", String(item.modId)]
+      : ["python3", "-I", root.backend, "uninstall", "--folder", item.folders[0]]
+    uninstallProcess.running = true
   }
 
   function reportDependencies(summary, dependencies, missing) {
@@ -287,6 +315,38 @@ Panel {
         root.errorUrl = result.failed[0].url || ""
       }
     }
+  }
+
+  Process {
+    id: uninstallProcess
+    property int removedModId: 0
+    command: []
+    stdout: StdioCollector { id: uninstallOutput; waitForEnd: true }
+    onExited: {
+      root.installingId = 0
+      root.removingKey = ""
+      root.refreshStatus()
+      var result = root.parse(uninstallOutput.text)
+      if (!result.ok) {
+        root.showError(result)
+        return
+      }
+      root.noticeMessage = "Removed " + result.name + ". Its settings stay in WTF. Reload the game UI with /reload."
+      if (result.requiredBy.length) root.errorMessage = "These addons require it and may stop working: " + result.requiredBy.join(", ") + "."
+      var remaining = Object.assign({}, root.updates)
+      delete remaining[removedModId]
+      root.updates = remaining
+      var modId = removedModId
+      root.results = root.results.map(function(item) {
+        return item.id === modId ? Object.assign({}, item, { installed: false }) : item
+      })
+    }
+  }
+
+  Timer {
+    id: removalReset
+    interval: 4000
+    onTriggered: root.pendingRemoval = ""
   }
 
   Process {
@@ -808,6 +868,21 @@ Panel {
                       root.openExternal(root.addonsPath + "/" + installedRow.modelData.folders[0])
                       root.close()
                     }
+                  }
+
+                  Button {
+                    readonly property string rowKey: root.removalKey(installedRow.modelData)
+                    text: root.removingKey === rowKey ? "Removing…" : (root.pendingRemoval === rowKey ? "Remove?" : "󰆴")
+                    bordered: true
+                    selected: root.pendingRemoval === rowKey
+                    foreground: root.pendingRemoval === rowKey ? Color.urgent : root.panelForeground
+                    fontSize: Style.font.caption
+                    horizontalPadding: Style.space(8)
+                    verticalPadding: Style.space(3)
+                    enabled: !root.installing
+                    opacity: enabled ? 1 : 0.6
+                    tooltipText: root.pendingRemoval === rowKey ? "Click again to remove" : "Uninstall addon"
+                    onClicked: root.requestRemoval(installedRow.modelData)
                   }
                 }
               }

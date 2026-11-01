@@ -543,15 +543,18 @@ def install_one(mod_id, config, key, addons):
     previous = (mods.get(str(mod_id)) or {}).get("folders") or []
     claimed_by_others = {folder for other_id, other in mods.items() if other_id != str(mod_id) for folder in other.get("folders") or []}
     remove_dropped_folders(previous, folders, claimed_by_others, addons)
-    mods[str(mod_id)] = {"name": name, "version": version, "fileId": entry.get("id"), "fileDate": entry.get("fileDate"), "folders": folders}
+    mods[str(mod_id)] = {"name": name, "version": version, "fileId": entry.get("id"), "fileDate": entry.get("fileDate"), "folders": folders, "requires": required_dependencies(entry)}
     write_private_json(state_path(), state)
     return {"modId": mod_id, "name": name, "version": version, "folders": folders}, entry
 
 
+def is_plain_folder_name(folder):
+    return isinstance(folder, str) and folder not in ("", ".", "..") and "/" not in folder and "\\" not in folder
+
+
 def remove_dropped_folders(previous, current, claimed_by_others, addons):
     for folder in previous:
-        is_plain_name = isinstance(folder, str) and folder not in ("", ".", "..") and "/" not in folder and "\\" not in folder
-        if is_plain_name and folder not in current and folder not in claimed_by_others:
+        if is_plain_folder_name(folder) and folder not in current and folder not in claimed_by_others:
             shutil.rmtree(addons / folder, ignore_errors=True)
 
 
@@ -642,6 +645,80 @@ def validate_key(key):
     raise rejection
 
 
+def discard_folders(folders, addons):
+    """Move folders out of AddOns first, so a failure can put them back and the game never sees half an addon."""
+    staging = Path(tempfile.mkdtemp(prefix=".addonix-", dir=addons.parent))
+    moved = []
+    try:
+        for folder in folders:
+            os.rename(addons / folder, staging / folder)
+            moved.append(folder)
+    except OSError:
+        for folder in moved:
+            os.rename(staging / folder, addons / folder)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return staging
+
+
+def remove_folder_entry(path):
+    if path.is_symlink():
+        path.unlink()
+    else:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def uninstall_folders(folders, addons):
+    staging = discard_folders(folders, addons)
+    for folder in folders:
+        remove_folder_entry(staging / folder)
+    shutil.rmtree(staging, ignore_errors=True)
+
+
+def uninstall_managed(mod_id, addons):
+    state = load_state()
+    mods = state.get("mods") or {}
+    mod = mods.get(str(mod_id))
+    if not mod:
+        raise AddonixError("not_found", "That addon is not installed by AddonixWoW.")
+    claimed = {folder for other_id, other in mods.items() if other_id != str(mod_id) for folder in other.get("folders") or []}
+    folders = [
+        folder
+        for folder in mod.get("folders") or []
+        if is_plain_folder_name(folder) and folder not in claimed and ((addons / folder).exists() or (addons / folder).is_symlink())
+    ]
+    uninstall_folders(folders, addons)
+    del mods[str(mod_id)]
+    write_private_json(state_path(), state)
+    required_by = [other.get("name", "") for other in mods.values() if mod_id in (other.get("requires") or [])]
+    return {"name": mod.get("name", ""), "folders": folders, "requiredBy": required_by}
+
+
+def uninstall_unmanaged(folder, addons):
+    if not is_plain_folder_name(folder):
+        raise AddonixError("usage", "That is not a valid addon folder name.")
+    mods = load_state().get("mods") or {}
+    if any(folder in (mod.get("folders") or []) for mod in mods.values()):
+        raise AddonixError("usage", "That folder belongs to an addon installed by AddonixWoW.")
+    path = addons / folder
+    if not path.is_dir():
+        raise AddonixError("not_found", "That addon folder does not exist.")
+    metadata = toc_metadata(path) or {}
+    uninstall_folders([folder], addons)
+    return {"name": metadata.get("name", folder), "folders": [folder], "requiredBy": []}
+
+
+def command_uninstall(args):
+    """Remove an addon's folders. Its settings in WTF stay, so a reinstall keeps them."""
+    if len(args) != 2 or args[0] not in ("--mod", "--folder"):
+        raise AddonixError("usage", "uninstall requires --mod <id> or --folder <name>.")
+    addons = require_addons_folder(load_config())
+    if args[0] == "--mod":
+        mod_id = parse_mod_id(args[1], "uninstall requires a numeric addon id.")
+        return with_install_lock(lambda: uninstall_managed(mod_id, addons))
+    return with_install_lock(lambda: uninstall_unmanaged(args[1], addons))
+
+
 def command_set_key(_args):
     # One line, not read(): the shell keeps stdin open after writing the secret.
     key = sys.stdin.readline().strip()
@@ -660,6 +737,7 @@ COMMANDS = {
     "install": command_install,
     "check-updates": command_check_updates,
     "update": command_update,
+    "uninstall": command_uninstall,
     "set-key": command_set_key,
 }
 
