@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.aledx18.addonixwow",
+  "name": "AddonixWoW",
+  "version": "0.1.0",
+  "author": "Aledev",
+  "license": "MIT",
+  "description": "Search and install CurseForge addons for World of Warcraft: Forever from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "AddonixWoW",
+    "category": "Gaming",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}
