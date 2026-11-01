@@ -4,6 +4,8 @@ Search and install [CurseForge](https://www.curseforge.com/wow) addons for **Wor
 
 - Search CurseForge, filtered to files built for WoW Forever.
 - Install in one click, with integrity checks and safe archive extraction.
+- Install required dependencies automatically.
+- Check for updates and update one addon or all of them.
 - See installed addons and open the AddOns folder.
 
 ## Requirements
@@ -45,8 +47,10 @@ It reads `default-prefix` from `~/.config/faugus-launcher/config.json`, then che
 ## Limitations
 
 - Some authors block third-party downloads, including popular addons like DBM and Details!. Those addons show a link to their CurseForge page instead.
-- CurseForge can block `/v1/mods/search` for a key while allowing other endpoints. The widget then lists only featured Forever addons and filters them by your text.
-- There are no updates or uninstall from the widget yet.
+- CurseForge's servers can reject a valid key on some requests and accept it on others, especially soon after creating it. Requests are retried; if search still fails, the widget lists only featured Forever addons and filters them by your text.
+- Updates cover addons installed by AddonixWoW. Addons added by hand are listed but not tracked.
+- A required dependency that the author blocks is reported with a link, and the main addon stays installed.
+- There is no uninstall from the widget yet.
 
 ## Development
 

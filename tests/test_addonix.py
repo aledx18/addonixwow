@@ -66,9 +66,14 @@ class FakeCurseForge(BaseHTTPRequestHandler):
         if self.headers.get("x-api-key") != KEY:
             self.send_json({}, 403)
             return
-        if parsed.path == "/v1/games/1/version-types":
+        if parsed.path == "/v1/games/1/version-types" and state.get("types_blocked"):
+            self.send_json({}, 403)
+        elif parsed.path == "/v1/games/1/version-types":
             self.send_json({"data": state["version_types"]})
         elif parsed.path == "/v1/mods/search" and state.get("search_blocked"):
+            self.send_json({}, 403)
+        elif parsed.path == "/v1/mods/search" and state.get("search_flaky", 0) > 0:
+            state["search_flaky"] -= 1
             self.send_json({}, 403)
         elif parsed.path == "/v1/mods/search" and state.get("truncate_search"):
             self.send_response(200)
@@ -91,6 +96,10 @@ class FakeCurseForge(BaseHTTPRequestHandler):
                     "pagination": {"totalCount": 1},
                 }
             )
+        elif parsed.path in state["extra_mods"]:
+            self.send_json({"data": state["extra_mods"][parsed.path]})
+        elif parsed.path in state["extra_files"]:
+            self.send_json({"data": state["extra_files"][parsed.path]})
         elif parsed.path == "/v1/mods/7":
             self.send_json({"data": {"id": 7, "name": "Deadly Boss Mods", "links": {"websiteUrl": "https://curseforge.com/wow/addons/dbm"}}})
         elif parsed.path == "/v1/mods/7/files":
@@ -126,6 +135,8 @@ class AddonixTest(unittest.TestCase):
             "blobs": {},
             "files": [],
             "download_url": None,
+            "extra_mods": {},
+            "extra_files": {},
             "version_types": [{"id": 1, "name": "Retail", "slug": "wow-retail"}, {"id": FOREVER_TYPE, "name": "WoW Forever", "slug": "wow-forever"}],
         }
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -255,6 +266,211 @@ class AddonixTest(unittest.TestCase):
         self.server.fake["search_blocked"] = True
         _, out = self.run_cli("search", "BAGS")
         self.assertEqual([r["name"] for r in out["results"]], ["Bagnon"])
+
+    def test_search_retries_intermittent_rejections(self):
+        self.server.fake["search_flaky"] = 2
+        code, out = self.run_cli("search", "dbm")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(out["limited"])
+
+    def test_search_uses_known_forever_id_when_version_types_are_rejected(self):
+        self.server.fake["types_blocked"] = True
+        code, out = self.run_cli("search", "dbm")
+        self.assertEqual(code, 0, out)
+        search = [r for r in self.server.fake["requests"] if r["path"] == "/v1/mods/search"][0]
+        self.assertEqual(search["query"]["gameVersionTypeId"], ["88568"])
+
+    def test_set_key_accepts_key_when_any_probe_succeeds(self):
+        self.server.fake["types_blocked"] = True
+        code, out = self.run_cli("set-key", key=None, stdin=KEY + "\n")
+        self.assertEqual(code, 0, out)
+
+    def add_mod(self, mod_id, name, folder, dependencies=(), file_id=None, blocked=False, date="2026-10-01T00:00:00Z"):
+        content = make_zip({f"{folder}/{folder}.toc": f"## Title: {name}\n", f"{folder}/main.lua": str(file_id or mod_id)})
+        fid = file_id or mod_id * 10
+        path = f"/cdn/{fid}.zip"
+        self.server.fake["blobs"][path] = content
+        entry = {
+            "id": fid,
+            "displayName": f"{name}-{fid}",
+            "releaseType": 1,
+            "fileDate": date,
+            "fileLength": len(content),
+            "downloadUrl": None if blocked else f"http://127.0.0.1:{self.port}{path}",
+            "hashes": [],
+            "dependencies": [{"modId": dep, "relationType": relation} for dep, relation in dependencies],
+        }
+        self.server.fake["extra_mods"][f"/v1/mods/{mod_id}"] = {"id": mod_id, "name": name, "links": {"websiteUrl": f"https://cf/{mod_id}"}}
+        self.server.fake["extra_files"][f"/v1/mods/{mod_id}/files"] = [entry]
+        return entry
+
+    def test_install_adds_required_dependencies_recursively_only(self):
+        self.add_mod(20, "Main", "MainAddon", [(21, 3), (22, 2)])
+        self.add_mod(21, "Lib", "LibAddon", [(23, 3)])
+        self.add_mod(22, "Optional", "OptionalAddon")
+        self.add_mod(23, "Base", "BaseAddon", [(20, 3)])
+        code, out = self.run_cli("install", "20")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["dependencies"], ["Lib", "Base"])
+        self.assertEqual(out["missingDependencies"], [])
+        self.assertTrue((self.addons / "LibAddon").is_dir())
+        self.assertTrue((self.addons / "BaseAddon").is_dir())
+        self.assertFalse((self.addons / "OptionalAddon").exists())
+
+    def test_install_reports_dependency_it_cannot_download_and_keeps_addon(self):
+        self.add_mod(20, "Main", "MainAddon", [(21, 3)])
+        self.add_mod(21, "Lib", "LibAddon", blocked=True)
+        code, out = self.run_cli("install", "20")
+        self.assertEqual(code, 0, out)
+        self.assertTrue((self.addons / "MainAddon").is_dir())
+        self.assertEqual(out["missingDependencies"][0]["name"], "Lib")
+        self.assertEqual(out["missingDependencies"][0]["url"], "https://cf/21")
+
+    def test_check_updates_lists_only_newer_files(self):
+        self.add_mod(20, "Main", "MainAddon")
+        self.add_mod(30, "Other", "OtherAddon")
+        self.run_cli("install", "20")
+        self.run_cli("install", "30")
+        _, none = self.run_cli("check-updates")
+        self.assertEqual(none["updates"], [])
+        self.add_mod(20, "Main", "MainAddon", file_id=201, date="2026-10-15T00:00:00Z")
+        self.add_mod(30, "Other", "OtherAddon", file_id=301, date="2026-01-01T00:00:00Z")
+        code, out = self.run_cli("check-updates")
+        self.assertEqual(code, 0)
+        self.assertEqual(out["updates"], [{"modId": 20, "name": "Main", "current": "Main-200", "latest": "Main-201"}])
+
+    def test_check_updates_ignores_addons_it_did_not_install(self):
+        folder = self.addons / "Manual"
+        folder.mkdir()
+        (folder / "Manual.toc").write_text("## Title: Manual\n")
+        _, out = self.run_cli("check-updates")
+        self.assertEqual(out["updates"], [])
+
+    def test_update_all_installs_new_files_and_new_dependencies(self):
+        self.add_mod(20, "Main", "MainAddon")
+        self.run_cli("install", "20")
+        self.add_mod(21, "Lib", "LibAddon")
+        self.add_mod(20, "Main", "MainAddon", [(21, 3)], file_id=201, date="2026-10-15T00:00:00Z")
+        code, out = self.run_cli("update")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["updated"], ["Main"])
+        self.assertEqual(out["dependencies"], ["Lib"])
+        self.assertEqual((self.addons / "MainAddon/main.lua").read_text(), "201")
+        _, check = self.run_cli("check-updates")
+        self.assertEqual(check["updates"], [])
+
+    def test_update_one_leaves_other_addons_alone(self):
+        self.add_mod(20, "Main", "MainAddon")
+        self.add_mod(30, "Other", "OtherAddon")
+        self.run_cli("install", "20")
+        self.run_cli("install", "30")
+        self.add_mod(20, "Main", "MainAddon", file_id=201, date="2026-10-15T00:00:00Z")
+        self.add_mod(30, "Other", "OtherAddon", file_id=301, date="2026-10-15T00:00:00Z")
+        _, out = self.run_cli("update", "20")
+        self.assertEqual(out["updated"], ["Main"])
+        self.assertEqual((self.addons / "OtherAddon/main.lua").read_text(), "30")
+
+    def test_update_reports_failures_per_addon(self):
+        self.add_mod(20, "Main", "MainAddon")
+        self.run_cli("install", "20")
+        self.add_mod(20, "Main", "MainAddon", file_id=201, date="2026-10-15T00:00:00Z", blocked=True)
+        code, out = self.run_cli("update")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["updated"], [])
+        self.assertEqual(out["failed"][0]["name"], "Main")
+        self.assertEqual((self.addons / "MainAddon/main.lua").read_text(), "20")
+
+    def test_update_removes_folders_the_new_version_dropped(self):
+        self.add_mod(20, "Main", "MainAddon")
+        self.add_mod(40, "Shared", "SharedAddon")
+        self.run_cli("install", "20")
+        self.run_cli("install", "40")
+        state_file = self.home / ".local/state/addonixwow/state.json"
+        state = json.loads(state_file.read_text())
+        (self.addons / "OldModule").mkdir()
+        state["mods"]["20"]["folders"] += ["OldModule", "SharedAddon", "../.."]
+        state_file.write_text(json.dumps(state))
+        self.add_mod(20, "Main", "MainAddon", file_id=201, date="2026-10-15T00:00:00Z")
+        self.run_cli("update", "20")
+        self.assertFalse((self.addons / "OldModule").exists())
+        self.assertTrue((self.addons / "SharedAddon").is_dir())
+        self.assertTrue(self.addons.parent.is_dir())
+
+    def test_updates_ignore_addons_whose_folders_were_deleted(self):
+        import shutil
+
+        self.add_mod(20, "Main", "MainAddon")
+        self.run_cli("install", "20")
+        shutil.rmtree(self.addons / "MainAddon")
+        self.add_mod(20, "Main", "MainAddon", file_id=201, date="2026-10-15T00:00:00Z")
+        _, check = self.run_cli("check-updates")
+        self.assertEqual(check["updates"], [])
+        _, update = self.run_cli("update")
+        self.assertEqual(update["updated"], [])
+        self.assertFalse((self.addons / "MainAddon").exists())
+
+    def test_dependency_with_deleted_folder_is_installed_again(self):
+        import shutil
+
+        self.add_mod(21, "Lib", "LibAddon")
+        self.run_cli("install", "21")
+        shutil.rmtree(self.addons / "LibAddon")
+        self.add_mod(20, "Main", "MainAddon", [(21, 3)])
+        _, out = self.run_cli("install", "20")
+        self.assertEqual(out["dependencies"], ["Lib"])
+        self.assertTrue((self.addons / "LibAddon").is_dir())
+
+    def add_conflicting_zip(self, mod_id, name):
+        entry = self.add_mod(mod_id, name, f"Addon{mod_id}")
+        content = make_zip({f"Addon{mod_id}/Addon{mod_id}.toc": "x", f"Addon{mod_id}/x": "file", f"Addon{mod_id}/x/y": "nested"})
+        self.server.fake["blobs"][f"/cdn/{entry['id']}.zip"] = content
+        entry["fileLength"] = len(content)
+        return entry
+
+    def test_file_error_on_dependency_is_reported_not_fatal(self):
+        self.add_mod(20, "Main", "MainAddon", [(21, 3)])
+        self.add_conflicting_zip(21, "Lib")
+        code, out = self.run_cli("install", "20")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["missingDependencies"][0]["name"], "Lib")
+
+    def test_file_error_does_not_stop_other_updates(self):
+        for mod_id, name in ((20, "A"), (21, "B"), (22, "C")):
+            self.add_mod(mod_id, name, f"Addon{mod_id}")
+            self.run_cli("install", str(mod_id))
+            self.add_mod(mod_id, name, f"Addon{mod_id}", file_id=mod_id * 100, date="2026-10-15T00:00:00Z")
+        entry = self.add_conflicting_zip(21, "B")
+        entry["id"] = 2100
+        entry["fileDate"] = "2026-10-15T00:00:00Z"
+        code, out = self.run_cli("update")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["updated"], ["A", "C"])
+        self.assertEqual(out["updatedIds"], [20, 22])
+        self.assertEqual(out["failed"][0]["name"], "B")
+
+    def test_update_rejects_addon_that_is_not_installed(self):
+        code, out = self.run_cli("update", "999")
+        self.assertEqual(code, 1)
+        self.assertEqual(out["code"], "not_found")
+
+    def test_install_keeps_its_usage_message_for_non_numeric_id(self):
+        code, out = self.run_cli("install", "abc")
+        self.assertEqual(code, 1)
+        self.assertEqual(out["message"], "install requires a numeric addon id.")
+
+    def test_update_rejects_extra_arguments(self):
+        code, out = self.run_cli("update", "1", "2")
+        self.assertEqual(code, 1)
+        self.assertEqual(out["code"], "usage")
+
+    def test_update_one_only_reports_its_own_failures(self):
+        self.add_mod(20, "Main", "MainAddon")
+        self.add_mod(30, "Other", "OtherAddon")
+        self.run_cli("install", "20")
+        self.run_cli("install", "30")
+        del self.server.fake["extra_files"]["/v1/mods/30/files"]
+        _, out = self.run_cli("update", "20")
+        self.assertEqual(out["failed"], [])
 
     def test_search_fails_closed_when_forever_is_not_listed(self):
         self.server.fake["version_types"] = [{"id": 1, "name": "Retail", "slug": "wow-retail"}]

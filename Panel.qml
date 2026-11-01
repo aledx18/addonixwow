@@ -23,7 +23,7 @@ Panel {
   property bool statusLoaded: false
   property var installed: []
   property var results: []
-  property string view: "browse"
+  property string view: "installed"
   property string query: ""
   property string searchedQuery: ""
   property bool searching: false
@@ -37,6 +37,15 @@ Panel {
   property int installingId: 0
   readonly property bool installing: installingId !== 0
   property bool savingKey: false
+  property bool editingKey: false
+  property var updates: ({})
+  property int failedChecks: 0
+  property bool checkingUpdates: false
+  property bool updatesChecked: false
+  readonly property int updateCount: Object.keys(root.updates).length
+  readonly property bool showKeyForm: root.statusLoaded && (!root.hasKey || root.editingKey)
+  // installingId value while "Update all" runs; real addon ids are positive.
+  readonly property int updatingAllId: -1
 
   function open() {
     root.controller.show()
@@ -113,6 +122,41 @@ Panel {
     installProcess.running = true
   }
 
+  function showBrowse() {
+    root.view = "browse"
+    // Opening the panel stays offline; the catalog loads only when asked for.
+    if (!root.searchLoaded) root.search(root.query)
+  }
+
+  function checkUpdates() {
+    if (updateCheckProcess.running) return
+    root.clearMessages()
+    root.checkingUpdates = true
+    updateCheckProcess.command = ["python3", "-I", root.backend, "check-updates"]
+    updateCheckProcess.running = true
+  }
+
+  function update(modId) {
+    if (root.installing) return
+    root.clearMessages()
+    root.installingId = modId
+    updateProcess.command = modId === root.updatingAllId
+      ? ["python3", "-I", root.backend, "update"]
+      : ["python3", "-I", root.backend, "update", String(modId)]
+    updateProcess.running = true
+  }
+
+  function reportDependencies(summary, dependencies, missing) {
+    var notice = summary
+    if (dependencies && dependencies.length) notice += " Also installed: " + dependencies.join(", ") + "."
+    root.noticeMessage = notice
+    if (missing && missing.length) {
+      var names = missing.map(function(item) { return item.name })
+      root.errorMessage = "Install these required addons by hand: " + names.join(", ") + "."
+      root.errorUrl = missing[0].url || ""
+    }
+  }
+
   function saveKey(key) {
     var trimmed = String(key || "").trim()
     if (!trimmed || keyProcess.running) return
@@ -158,7 +202,6 @@ Panel {
       root.addonsPath = result.addonsPath
       root.hasKey = result.hasKey
       root.installed = result.installed
-      if (root.hasKey && !root.searchLoaded) root.search(root.query)
     }
   }
 
@@ -176,7 +219,7 @@ Panel {
       } else {
         root.results = []
         root.showError(result)
-        if (result.code === "invalid_key" || result.code === "missing_key") root.hasKey = false
+        if (result.code === "missing_key") root.hasKey = false
       }
       if (root.searchQueued && root.pendingQuery !== root.searchedQuery) Qt.callLater(root.search, root.pendingQuery)
       root.searchQueued = false
@@ -192,12 +235,56 @@ Panel {
       root.installingId = 0
       var result = root.parse(installOutput.text)
       if (result.ok) {
-        root.noticeMessage = "Installed " + result.name + ". Reload the game UI with /reload."
+        root.reportDependencies("Installed " + result.name + ". Reload the game UI with /reload.", result.dependencies, result.missingDependencies)
         root.markInstalled(modId)
         root.refreshStatus()
         Util.execDetached("notify-send AddonixWoW " + root.shellQuote("Installed " + result.name))
       } else {
         root.showError(result)
+      }
+    }
+  }
+
+  Process {
+    id: updateCheckProcess
+    command: []
+    stdout: StdioCollector { id: updateCheckOutput; waitForEnd: true }
+    onExited: {
+      root.checkingUpdates = false
+      var result = root.parse(updateCheckOutput.text)
+      if (!result.ok) {
+        root.showError(result)
+        return
+      }
+      var found = {}
+      result.updates.forEach(function(item) { found[item.modId] = item.latest })
+      root.updates = found
+      root.failedChecks = result.failed.length
+      root.updatesChecked = true
+      if (result.failed.length) root.errorMessage = "Could not check: " + result.failed.map(function(item) { return item.name }).join(", ") + "."
+      else if (!result.updates.length) root.noticeMessage = "Everything is up to date."
+    }
+  }
+
+  Process {
+    id: updateProcess
+    command: []
+    stdout: StdioCollector { id: updateOutput; waitForEnd: true }
+    onExited: {
+      root.installingId = 0
+      var result = root.parse(updateOutput.text)
+      root.refreshStatus()
+      if (!result.ok) {
+        root.showError(result)
+        return
+      }
+      var remaining = Object.assign({}, root.updates)
+      result.updatedIds.forEach(function(modId) { delete remaining[modId] })
+      root.updates = remaining
+      if (result.updated.length) root.reportDependencies("Updated " + result.updated.join(", ") + ". Reload the game UI with /reload.", result.dependencies, result.missingDependencies)
+      if (result.failed.length) {
+        root.errorMessage = "Could not update " + result.failed.map(function(item) { return item.name + " (" + item.reason + ")" }).join(", ")
+        root.errorUrl = result.failed[0].url || ""
       }
     }
   }
@@ -218,6 +305,10 @@ Panel {
       var result = root.parse(keyOutput.text)
       if (result.ok) {
         keyField.text = ""
+        root.editingKey = false
+        root.searchLoaded = false
+        if (root.view === "browse") root.search(root.query)
+        root.noticeMessage = "API key saved."
         root.refreshStatus()
       } else {
         root.showError(result)
@@ -330,7 +421,7 @@ Panel {
         Column {
           width: parent.width
           spacing: Style.space(8)
-          visible: root.statusLoaded && !root.hasKey
+          visible: root.showKeyForm
 
           Text {
             width: parent.width
@@ -392,7 +483,7 @@ Panel {
             fontSize: Style.font.caption
             horizontalPadding: Style.space(10)
             verticalPadding: Style.space(4)
-            onClicked: root.view = "browse"
+            onClicked: root.showBrowse()
           }
 
           Button {
@@ -404,6 +495,18 @@ Panel {
             horizontalPadding: Style.space(10)
             verticalPadding: Style.space(4)
             onClicked: root.view = "installed"
+          }
+
+          Button {
+            text: root.editingKey ? "Cancel" : "Change key"
+            bordered: true
+            selected: false
+            visible: root.hasKey
+            foreground: root.panelForeground
+            fontSize: Style.font.caption
+            horizontalPadding: Style.space(10)
+            verticalPadding: Style.space(4)
+            onClicked: root.editingKey = !root.editingKey
           }
         }
 
@@ -458,7 +561,7 @@ Panel {
         Text {
           width: parent.width
           visible: root.view === "browse" && root.hasKey && root.searchLimited
-          text: "CurseForge blocks full search for this key. Showing featured WoW Forever addons only."
+          text: "CurseForge rejected the search just now. Showing featured WoW Forever addons only."
           color: root.panelForeground
           opacity: 0.65
           font.family: root.fontFamily
@@ -579,6 +682,38 @@ Panel {
           }
         }
 
+        Row {
+          spacing: Style.space(6)
+          visible: root.hasKey && root.view === "installed" && root.installed.length > 0
+
+          Button {
+            text: root.checkingUpdates ? "Checking…" : "Check updates"
+            bordered: true
+            selected: false
+            foreground: root.panelForeground
+            fontSize: Style.font.caption
+            horizontalPadding: Style.space(10)
+            verticalPadding: Style.space(4)
+            enabled: !root.checkingUpdates && !root.installing
+            opacity: enabled ? 1 : 0.6
+            onClicked: root.checkUpdates()
+          }
+
+          Button {
+            visible: root.updateCount > 0
+            text: root.installingId === root.updatingAllId ? "Updating…" : "Update all (" + root.updateCount + ")"
+            bordered: true
+            selected: false
+            foreground: root.panelForeground
+            fontSize: Style.font.caption
+            horizontalPadding: Style.space(10)
+            verticalPadding: Style.space(4)
+            enabled: !root.installing
+            opacity: enabled ? 1 : 0.6
+            onClicked: root.update(root.updatingAllId)
+          }
+        }
+
         Text {
           width: parent.width
           visible: root.statusLoaded && (root.view === "installed" || !root.hasKey) && root.installed.length === 0
@@ -626,10 +761,10 @@ Panel {
 
                 Text {
                   id: installedVersion
-                  anchors.right: openAddon.left
+                  anchors.right: rowActions.left
                   anchors.rightMargin: Style.space(8)
                   anchors.verticalCenter: parent.verticalCenter
-                  width: Math.min(implicitWidth, Style.space(140))
+                  width: Math.min(implicitWidth, Style.space(120))
                   text: installedRow.modelData.version
                   color: root.panelForeground
                   opacity: 0.55
@@ -638,21 +773,41 @@ Panel {
                   elide: Text.ElideRight
                 }
 
-                Button {
-                  id: openAddon
+                Row {
+                  id: rowActions
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
-                  text: "󰉋"
-                  bordered: true
-                  selected: false
-                  foreground: root.panelForeground
-                  fontSize: Style.font.caption
-                  horizontalPadding: Style.space(8)
-                  verticalPadding: Style.space(3)
-                  tooltipText: "Open addon folder"
-                  onClicked: {
-                    root.openExternal(root.addonsPath + "/" + installedRow.modelData.folders[0])
-                    root.close()
+                  spacing: Style.space(4)
+
+                  Button {
+                    readonly property string latest: root.updates[installedRow.modelData.modId] || ""
+                    visible: latest.length > 0
+                    text: root.installingId === installedRow.modelData.modId ? "Updating…" : "Update"
+                    bordered: true
+                    selected: false
+                    foreground: root.panelForeground
+                    fontSize: Style.font.caption
+                    horizontalPadding: Style.space(8)
+                    verticalPadding: Style.space(3)
+                    enabled: !root.installing
+                    opacity: enabled ? 1 : 0.6
+                    tooltipText: latest
+                    onClicked: root.update(installedRow.modelData.modId)
+                  }
+
+                  Button {
+                    text: "󰉋"
+                    bordered: true
+                    selected: false
+                    foreground: root.panelForeground
+                    fontSize: Style.font.caption
+                    horizontalPadding: Style.space(8)
+                    verticalPadding: Style.space(3)
+                    tooltipText: "Open addon folder"
+                    onClicked: {
+                      root.openExternal(root.addonsPath + "/" + installedRow.modelData.folders[0])
+                      root.close()
+                    }
                   }
                 }
               }

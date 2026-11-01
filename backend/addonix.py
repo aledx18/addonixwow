@@ -28,6 +28,10 @@ SORT_BY_POPULARITY = 2
 PAGE_SIZE = 30
 TIMEOUT_SECONDS = 20
 RELEASE_TYPE_STABLE = 1
+RELATION_REQUIRED = 3
+AUTH_ATTEMPTS = 3
+# Used when CurseForge rejects the version-types lookup; the id comes from that same endpoint.
+KNOWN_FOREVER_TYPE_ID = 88568
 HASH_ALGORITHMS = {1: "sha1", 2: "md5"}
 MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024
@@ -39,11 +43,12 @@ COLOR_CODES = re.compile(r"\|c[0-9a-fA-F]{8}|\|r")
 
 
 class AddonixError(Exception):
-    def __init__(self, code, message, url=None):
+    def __init__(self, code, message, url=None, name=None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.url = url
+        self.name = name
 
 
 def config_path():
@@ -158,6 +163,21 @@ def open_url(url, key, body=None):
 
 
 def api_get(path, key, params=None, body=None):
+    # CurseForge's servers can disagree about a valid key: the same request may get 403
+    # from one and 200 from another, and a changed query can reach a different one.
+    for attempt in range(AUTH_ATTEMPTS):
+        query = dict(params or {})
+        if attempt:
+            query["_"] = attempt
+        try:
+            return api_request(path, key, query, body)
+        except AddonixError as error:
+            if error.code != "invalid_key" or attempt == AUTH_ATTEMPTS - 1:
+                raise
+    raise AssertionError("unreachable")
+
+
+def api_request(path, key, params, body):
     url = api_base() + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -167,7 +187,7 @@ def api_get(path, key, params=None, body=None):
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):
-            raise AddonixError("invalid_key", "CurseForge rejected the API key.") from None
+            raise AddonixError("invalid_key", "CurseForge rejected the request. If the key is new, try again in a few minutes.") from None
         if error.code == 404:
             raise AddonixError("not_found", "CurseForge has no such addon or file.") from None
         raise AddonixError("network", f"CurseForge returned HTTP {error.code}.") from None
@@ -200,7 +220,12 @@ def forever_type_id(config, key):
     state = load_state()
     if state.get("gameVersionTypeId"):
         return state["gameVersionTypeId"]
-    type_id = fetch_forever_type_id(key)
+    try:
+        type_id = fetch_forever_type_id(key)
+    except AddonixError as error:
+        if error.code != "invalid_key":
+            raise
+        return KNOWN_FOREVER_TYPE_ID
     if not type_id:
         raise AddonixError("flavor_unavailable", "CurseForge does not list WoW Forever as a game version yet.")
     state["gameVersionTypeId"] = type_id
@@ -390,7 +415,7 @@ def command_search(args):
     except AddonixError as error:
         if error.code != "invalid_key":
             raise
-        # Some keys may read addons but not search. featured answers 403 too if the key is really bad.
+        # Search can be rejected while other endpoints work. featured answers 403 too if the key is really bad.
         mods = featured_mods(key, type_id, query)
         limited = True
     installed = load_state().get("mods") or {}
@@ -413,16 +438,13 @@ def command_search(args):
     }
 
 
-def command_install(args):
-    if len(args) != 1 or not args[0].isdigit():
-        raise AddonixError("usage", "install requires a numeric addon id.")
-    mod_id = int(args[0])
-    config = load_config()
-    key = require_key(config)
-    addons, _source = resolve_addons_folder(config)
-    if not addons:
-        raise AddonixError("addons_not_found", "Could not find the WoW Forever AddOns folder.")
+def parse_mod_id(value, message):
+    if not (value.isascii() and value.isdigit()):
+        raise AddonixError("usage", message)
+    return int(value)
 
+
+def with_install_lock(action):
     lock_path = state_path().with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as lock:
@@ -430,20 +452,69 @@ def command_install(args):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise AddonixError("busy", "Another addon install is running.") from None
-        return install_locked(mod_id, config, key, addons)
+        return action()
 
 
-def install_locked(mod_id, config, key, addons):
+def require_addons_folder(config):
+    addons, _source = resolve_addons_folder(config)
+    if not addons:
+        raise AddonixError("addons_not_found", "Could not find the WoW Forever AddOns folder.")
+    return addons
+
+
+def command_install(args):
+    if len(args) != 1:
+        raise AddonixError("usage", "install requires a numeric addon id.")
+    mod_id = parse_mod_id(args[0], "install requires a numeric addon id.")
+    config = load_config()
+    key = require_key(config)
+    addons = require_addons_folder(config)
+    return with_install_lock(lambda: install_with_dependencies(mod_id, config, key, addons))
+
+
+def is_present(mod, addons):
+    """Folders deleted by hand mean the addon is gone, whatever the state file remembers."""
+    return any((addons / folder).is_dir() for folder in mod.get("folders") or [])
+
+
+def required_dependencies(entry):
+    return [dep.get("modId") for dep in entry.get("dependencies") or [] if dep.get("relationType") == RELATION_REQUIRED]
+
+
+def install_with_dependencies(mod_id, config, key, addons):
+    """Install an addon, then what it requires. A failed dependency is reported, never fatal."""
+    result, entry = install_one(mod_id, config, key, addons)
+    pending = required_dependencies(entry)
+    seen = {mod_id}
+    names = []
+    missing = []
+    while pending:
+        dependency = pending.pop(0)
+        known = (load_state().get("mods") or {}).get(str(dependency))
+        if dependency in seen or (known and is_present(known, addons)):
+            continue
+        seen.add(dependency)
+        try:
+            dependency_result, dependency_entry = install_one(dependency, config, key, addons)
+        except AddonixError as error:
+            missing.append({"modId": dependency, "name": error.name or f"Addon {dependency}", "reason": error.message, "url": error.url or ""})
+            continue
+        names.append(dependency_result["name"])
+        pending.extend(required_dependencies(dependency_entry))
+    return {**result, "dependencies": names, "missingDependencies": missing}
+
+
+def install_one(mod_id, config, key, addons):
     type_id = forever_type_id(config, key)
     mod = api_get(f"/v1/mods/{mod_id}", key).get("data") or {}
+    name = mod.get("name", "")
     website = (mod.get("links") or {}).get("websiteUrl", "")
-    files = api_get(f"/v1/mods/{mod_id}/files", key, {"gameVersionTypeId": type_id, "pageSize": 50}).get("data") or []
-    entry = choose_file(files)
+    entry = latest_file(mod_id, type_id, key)
     if not entry:
-        raise AddonixError("no_compatible_file", "This addon has no file for WoW Forever yet.", website)
+        raise AddonixError("no_compatible_file", "This addon has no file for WoW Forever yet.", website, name)
     url = file_download_url(mod_id, entry, key)
     if not url:
-        raise AddonixError("distribution_disabled", "The author only allows downloads from the CurseForge site.", website)
+        raise AddonixError("distribution_disabled", "The author only allows downloads from the CurseForge site.", website, name)
 
     addons.mkdir(parents=True, exist_ok=True)
     # Staging sits beside AddOns so the final renames stay on one filesystem,
@@ -452,18 +523,123 @@ def install_locked(mod_id, config, key, addons):
     try:
         archive_path = staging / "addon.zip"
         extract_root = staging / "extract"
-        download(url, key, archive_path, entry)
-        extract_root.mkdir()
-        folders = extract_archive(archive_path, extract_root)
-        swap_folders(folders, extract_root, addons, staging / "backup")
+        try:
+            download(url, key, archive_path, entry)
+            extract_root.mkdir()
+            folders = extract_archive(archive_path, extract_root)
+            swap_folders(folders, extract_root, addons, staging / "backup")
+        except AddonixError as error:
+            error.name = name
+            error.url = error.url or website
+            raise
+        except OSError as error:
+            raise AddonixError("io", f"File error: {error.strerror}", website, name) from None
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
     version = entry.get("displayName") or entry.get("fileName") or ""
     state = load_state()
-    state.setdefault("mods", {})[str(mod_id)] = {"name": mod.get("name", ""), "version": version, "fileId": entry.get("id"), "folders": folders}
+    mods = state.setdefault("mods", {})
+    previous = (mods.get(str(mod_id)) or {}).get("folders") or []
+    claimed_by_others = {folder for other_id, other in mods.items() if other_id != str(mod_id) for folder in other.get("folders") or []}
+    remove_dropped_folders(previous, folders, claimed_by_others, addons)
+    mods[str(mod_id)] = {"name": name, "version": version, "fileId": entry.get("id"), "fileDate": entry.get("fileDate"), "folders": folders}
     write_private_json(state_path(), state)
-    return {"modId": mod_id, "name": mod.get("name", ""), "version": version, "folders": folders}
+    return {"modId": mod_id, "name": name, "version": version, "folders": folders}, entry
+
+
+def remove_dropped_folders(previous, current, claimed_by_others, addons):
+    for folder in previous:
+        is_plain_name = isinstance(folder, str) and folder not in ("", ".", "..") and "/" not in folder and "\\" not in folder
+        if is_plain_name and folder not in current and folder not in claimed_by_others:
+            shutil.rmtree(addons / folder, ignore_errors=True)
+
+
+def latest_file(mod_id, type_id, key):
+    files = api_get(f"/v1/mods/{mod_id}/files", key, {"gameVersionTypeId": type_id, "pageSize": 50}).get("data") or []
+    return choose_file(files)
+
+
+def is_newer(entry, installed):
+    if not entry or entry.get("id") == installed.get("fileId"):
+        return False
+    installed_date = installed.get("fileDate")
+    return not installed_date or (entry.get("fileDate") or "") > installed_date
+
+
+def find_updates(config, key, addons, only=None):
+    type_id = forever_type_id(config, key)
+    updates = []
+    failed = []
+    for mod_id, installed in (load_state().get("mods") or {}).items():
+        if not is_present(installed, addons) or (only is not None and int(mod_id) != only):
+            continue
+        try:
+            entry = latest_file(mod_id, type_id, key)
+        except AddonixError as error:
+            failed.append({"modId": int(mod_id), "name": installed.get("name", ""), "reason": error.message, "url": ""})
+            continue
+        if is_newer(entry, installed):
+            updates.append({"modId": int(mod_id), "name": installed.get("name", ""), "current": installed.get("version", ""), "latest": entry.get("displayName") or entry.get("fileName") or ""})
+    return updates, failed
+
+
+def command_check_updates(_args):
+    config = load_config()
+    updates, failed = find_updates(config, require_key(config), require_addons_folder(config))
+    return {"updates": updates, "failed": failed}
+
+
+def command_update(args):
+    """Update one addon, or with no id every addon that has a newer file."""
+    if len(args) > 1:
+        raise AddonixError("usage", "update takes at most one addon id.")
+    only = parse_mod_id(args[0], "update requires a numeric addon id.") if args else None
+    config = load_config()
+    key = require_key(config)
+    addons = require_addons_folder(config)
+    if only is not None:
+        installed = (load_state().get("mods") or {}).get(str(only))
+        if not installed or not is_present(installed, addons):
+            raise AddonixError("not_found", "That addon is not installed by AddonixWoW.")
+
+    def run():
+        candidates, failed = find_updates(config, key, addons, only)
+        updated = []
+        updated_ids = []
+        dependencies = []
+        missing = []
+        for candidate in candidates:
+            try:
+                result = install_with_dependencies(candidate["modId"], config, key, addons)
+            except AddonixError as error:
+                failed.append({"modId": candidate["modId"], "name": candidate["name"], "reason": error.message, "url": error.url or ""})
+                continue
+            updated.append(result["name"])
+            updated_ids.append(candidate["modId"])
+            dependencies.extend(result["dependencies"])
+            missing.extend(result["missingDependencies"])
+        return {"updated": updated, "updatedIds": updated_ids, "dependencies": dependencies, "missingDependencies": missing, "failed": failed}
+
+    return with_install_lock(run)
+
+
+def validate_key(key):
+    # A new key can work on some endpoints before others, so one success is enough.
+    probes = (
+        (f"/v1/games/{WOW_GAME_ID}/version-types", None),
+        ("/v1/mods/search", {"gameId": WOW_GAME_ID, "pageSize": 1}),
+    )
+    rejection = None
+    for path, params in probes:
+        try:
+            api_get(path, key, params)
+            return
+        except AddonixError as error:
+            if error.code != "invalid_key":
+                raise
+            rejection = error
+    raise rejection
 
 
 def command_set_key(_args):
@@ -471,7 +647,7 @@ def command_set_key(_args):
     key = sys.stdin.readline().strip()
     if not key:
         raise AddonixError("missing_key", "The API key is empty.")
-    fetch_forever_type_id(key)
+    validate_key(key)
     config = load_config()
     config["apiKey"] = key
     write_private_json(config_path(), config)
@@ -482,6 +658,8 @@ COMMANDS = {
     "status": command_status,
     "search": command_search,
     "install": command_install,
+    "check-updates": command_check_updates,
+    "update": command_update,
     "set-key": command_set_key,
 }
 
